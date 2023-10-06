@@ -41,6 +41,7 @@ from torch.distributed import ProcessGroup
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+import transformer_engine.pytorch as te
 
 from fairscale.nn.misc import FlattenParamsWrapper
 from fairscale.nn.misc.flatten_params_wrapper import FlatParameter
@@ -149,6 +150,14 @@ class OffloadConfig:
     offload_type: Optional[str] = None
     # Path to the directory for storing parameters offloaded to disk.
     dir: Optional[str] = None
+
+
+def _is_te_module_with_weights(m: nn.Module) -> bool:
+    return isinstance(m, (te.Linear, te.LayerNormLinear, te.LayerNormMLP))
+
+
+def _is_layer_norm_weight(name: str) -> bool:
+    return name == "layer_norm_weight"
 
 
 class FullyShardedDataParallel(nn.Module):
@@ -688,7 +697,7 @@ class FullyShardedDataParallel(nn.Module):
     @property
     def params_with_grad(self) -> List[Parameter]:
         """[p for p in self.parameters() if p.grad is not None]"""
-        return [p for p in self.parameters() if p.grad is not None or getattr(p, "main_grad", None) is not None]
+        return [(p.main_grad if getattr(p, "main_grad", None) is not None else p.grad) for p in self.parameters()]
 
     @torch.no_grad()
     def clip_grad_norm_(
@@ -1681,7 +1690,10 @@ class FullyShardedDataParallel(nn.Module):
         # then subsequent hook callbacks will see POST state.
         self.assert_state([TrainingState.BACKWARD_PRE, TrainingState.BACKWARD_POST])
         self.training_state = TrainingState.BACKWARD_POST
-        if param.grad is None and getattr(param, "main_grad", None) is None:
+        main_grad_or_grad = (
+            param.main_grad if getattr(param, "main_grad", None) is not None else param.grad
+        )
+        if main_grad_or_grad is None:
             return
 
         if hasattr(param, "_linked_param"):
@@ -1694,9 +1706,9 @@ class FullyShardedDataParallel(nn.Module):
             if hasattr(param._linked_param, "_is_shared") and param._linked_param._is_shared:
                 param = param._linked_param
 
-        # assert param.grad is not None, param.shape
-        # if param.grad.requires_grad:
-        #     raise RuntimeError("FSDP only works with gradients that don't require gradients")
+        assert main_grad_or_grad is not None, param.shape
+        if main_grad_or_grad.requires_grad:
+            raise RuntimeError("FSDP only works with gradients that don't require gradients")
 
         if self._require_backward_grad_sync or self.reshard_after_forward:
             # Free full params. As a special case, we don't free the full params
@@ -1722,24 +1734,28 @@ class FullyShardedDataParallel(nn.Module):
         # reductions in post_backward stream.
         self._streams["post_backward"].wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._streams["post_backward"]):
-            if param.main_grad is not None and not param.main_grad.eq(0).all():
-                orig_grad_data = param.main_grad
-                param.grad = None
-            else:
-                orig_grad_data = param.grad
+            orig_grad_data = main_grad_or_grad
+
+            if (
+                isinstance(param, FlatParameter)
+                and param.grad is not None
+                and getattr(param, "main_grad", None) is not None
+            ):
+                grad_views = param.get_param_views(param.grad)
+                main_grad_views = param.get_param_views(param.main_grad)
+                for (_, m, n), grad, main_grad in zip(
+                    param._param_infos, grad_views, main_grad_views
+                ):
+                    if _is_te_module_with_weights(m) and _is_layer_norm_weight(n):
+                        main_grad.copy_(grad)
 
             if self.fp32_reduce_scatter:
-                if param.grad is not None:
-                    param.main_grad.copy_(param.grad)
-                    param.grad = None
+                main_grad_or_grad.data = main_grad_or_grad.to(param.dtype)
 
             if self.gradient_predivide_factor > 1:
                 # Average grad by world_size for consistency with PyTorch DDP.
                 # param.grad.data.div_(self.gradient_predivide_factor)
-                if param.grad is not None:
-                    param.grad.div_(self.gradient_predivide_factor)
-                else:
-                    param.main_grad.div_(self.gradient_predivide_factor)
+                main_grad_or_grad.div_(self.gradient_predivide_factor)
 
             if param._is_sharded:
                 assert self._reducer is not None
@@ -1747,8 +1763,8 @@ class FullyShardedDataParallel(nn.Module):
                 # param._saved_grad_shard. If this FSDP module was called multiple times it's possible that multiple
                 # gradient reductions will happen in an undefined order. But addition commutes, so this order doesn't
                 # matter, neglecting rounding.
-                if param.grad is not None:
-                    grad = param.grad
+                grad = main_grad_or_grad
+                if getattr(param, "main_grad", None) is not None:
                     # Clear grad on the tensor, so any repeated gradient computations do not interfere with this reduction.
                     #
                     # The effect on memory consumption is not usually significant. No extra memory is allocated if this
@@ -1760,10 +1776,9 @@ class FullyShardedDataParallel(nn.Module):
                     # This ensures the `default` stream will wait for the `post_backward` stream to complete the last
                     # reduction for this module, before scheduling additional reduction work. Then at most there are two
                     # unsharded gradients allocated; one for a pending reduction, and one for gradient computation.
-                    param.grad = None
-                else:
-                    grad = param.main_grad
                     param.main_grad = None
+                else:
+                    param.grad = None
                 callback_fn = functools.partial(self._post_reduction_hook, param)
                 self._reducer.reduce_scatter_async(
                     grad, group=self.process_group_reduce_scatter, callback_fn=callback_fn
@@ -1773,10 +1788,7 @@ class FullyShardedDataParallel(nn.Module):
                 # world_size == 1. This could be relaxed in the future, in which
                 # case grads should be all-reduced here.
                 assert self.world_size == 1
-                if param.grad is not None:
-                    self._post_reduction_hook(param, param.grad)
-                else:
-                    self._post_reduction_hook(param, param.main_grad)
+                self._post_reduction_hook(param, main_grad_or_grad)
 
             # After _post_backward_hook returns, orig_grad_data will eventually
             # go out of scope, at which point it could otherwise be freed for
@@ -1802,7 +1814,7 @@ class FullyShardedDataParallel(nn.Module):
         # non-blocking. The downside is a bit more D2H transfer in that case.
         if self.fp32_reduce_scatter:
             orig_param_grad_data = reduced_grad.data
-            # reduced_grad.data = reduced_grad.data.to(dtype=param.data.dtype)
+            reduced_grad.data = reduced_grad.data.to(dtype=param.data.dtype)
             # Don't let this memory get reused until after the transfer.
             orig_param_grad_data.record_stream(torch.cuda.current_stream())
 
@@ -1903,9 +1915,15 @@ class FullyShardedDataParallel(nn.Module):
                     if p.shape != p._saved_grad_shard.shape:
                         self._use_fp32_param_shard([p])
                     if p._saved_grad_shard.dtype != p.dtype:
-                        p.main_grad = p._saved_grad_shard
+                        if getattr(p, "main_grad", None) is not None:
+                            p.main_grad = p._saved_grad_shard
+                        else:
+                            p.grad = p._saved_grad_shard.to(p.dtype)
                     else:
-                        p.grad = p._saved_grad_shard
+                        if getattr(p, "main_grad", None) is not None:
+                            p.main_grad = p._saved_grad_shard
+                        else:
+                            p.grad = p._saved_grad_shard
 
                 if hasattr(p, "_saved_grad_shard"):
                     delattr(p, "_saved_grad_shard")
@@ -2152,6 +2170,16 @@ class FullyShardedDataParallel(nn.Module):
         right shape, device, accumulated values, etc.
         """
         for p in self.params:
+            if isinstance(p, FlatParameter) and all(
+                _is_te_module_with_weights(info[1]) for info in p._param_infos
+            ):
+                if getattr(p, "main_grad", None) is None:
+                    p.main_grad = torch.empty_like(p, dtype=torch.float)
+                main_grad_views = p.get_param_views(p.main_grad)
+                for (_, m, n), main_grad in zip(p._param_infos, main_grad_views):
+                    if not _is_layer_norm_weight(n):
+                        getattr(m, n).main_grad = main_grad
+
             if p.grad is not None:
                 if p.grad.device != p.data.device:
                     p.grad = None
